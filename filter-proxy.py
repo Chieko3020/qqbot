@@ -214,7 +214,7 @@ LUNA_BLOCK_PATTERNS = [
     _re.compile(r"<script|javascript:|onerror=|onload=", _re.IGNORECASE),
     _re.compile(r"/start|/stop|/restart|/backup|/new|/reset|/model|/yolo"),
     _re.compile(r"\brm\s*-rf\b|\brm\s.*[/]\b|sudo\s+rm|chmod\s+777|wget.*\|.*sh", _re.IGNORECASE),
-    _re.compile(r"\bapi[_-]?key\b|\bsecret\b|\btoken\b|\bpassword\b|\bcredential\b|\bapi\b|\bkey\b", _re.IGNORECASE),
+    _re.compile(r"\bapi[_-]?key\b|\bsecret\b|\btoken\b|\bpassword|\bcredential\b|\bapi\b|\bkey\b", _re.IGNORECASE),
     _re.compile(r"\.env\b|/etc/passwd|/etc/shadow|config\.yaml", _re.IGNORECASE),
     _re.compile(r"\bcurl\b.*\bhttps?://|wget\s+https?://", _re.IGNORECASE),
     _re.compile(r"\bdd\s+if=|mkfs\.|:\(\)\s*{\s*:\s*\|:&\s*}", _re.IGNORECASE),
