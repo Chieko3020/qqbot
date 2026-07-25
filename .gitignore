@@ -2,3 +2,6 @@
 __pycache__/
 .daily_usage
 *.log
+.music_cache.json
+.music_radio.json
+.music_playlist.json
