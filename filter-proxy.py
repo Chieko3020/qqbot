@@ -51,8 +51,45 @@ def send_qq(openid, content, msg_id=None):
     req = Request(SEND_MSG_URL.format(openid=openid),
                   data=json.dumps(body).encode(),
                   headers={"Content-Type": "application/json", "Authorization": f"QQBot {get_token()}"})
-    try: urlopen(req, timeout=10)
-    except HTTPError as e: print(f"[WARN] QQ API {e.code}", file=sys.stderr)
+    try:
+        urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"[send_qq] error: {e}", file=sys.stderr)
+
+UPLOAD_URL = "https://api.sgroup.qq.com/v2/users/{openid}/files"
+
+def upload_and_send_voice(openid, audio_url, msg_id=None):
+    """Upload a remote audio URL to QQ as voice, then send as voice message."""
+    token = get_token()
+    # Step 1: upload by URL
+    body = {"file_type": 3, "url": audio_url}  # 3=voice
+    req = Request(UPLOAD_URL.format(openid=openid),
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": f"QQBot {token}"})
+    try:
+        resp = json.loads(urlopen(req, timeout=30).read())
+        file_info = resp.get("file_info", "")
+    except Exception as e:
+        print(f"[upload] error: {e}", file=sys.stderr)
+        return False
+
+    if not file_info:
+        print(f"[upload] no file_info in response: {resp}", file=sys.stderr)
+        return False
+
+    # Step 2: send as voice message (msg_type=7)
+    body2 = {"media": {"file_info": file_info}, "msg_type": 7}
+    if msg_id:
+        body2["msg_id"] = msg_id
+    req2 = Request(SEND_MSG_URL.format(openid=openid),
+                   data=json.dumps(body2).encode(),
+                   headers={"Content-Type": "application/json", "Authorization": f"QQBot {token}"})
+    try:
+        urlopen(req2, timeout=10)
+        return True
+    except Exception as e:
+        print(f"[send_media] error: {e}", file=sys.stderr)
+        return False
 
 def run(cmd, timeout=15):
     try:
@@ -254,7 +291,7 @@ LUNA_RATE_LIMIT = 10
 LUNA_RATE_WINDOW = 300  # 5 minutes
 _luna_ratelimit: dict[str, list[float]] = {}  # openid → [timestamps]
 
-def fmt_luna(user_msg: str, openid: str = "") -> str:
+def fmt_luna(user_msg: str, openid: str = "", msg_id: str = "") -> str:
     """Call DeepSeek API with Luna persona."""
     if not user_msg.strip():
         return "🌸 有什么事吗？"
@@ -358,8 +395,9 @@ def _load_music():
         pass
     return _music_cache
 
-def fmt_music(user_msg: str = "", openid: str = "") -> str:
-    """Random pick a song from radio list, return formatted info."""
+def fmt_music(user_msg: str = "", openid: str = "", msg_id: str = "") -> str | None:
+    """Random pick a song from radio list, upload as voice message.
+    Returns None if upload succeeded (already sent via upload_and_send_voice)."""
     songs = _load_music()
     if not songs:
         return "🎵 音乐列表暂时无法加载，请稍后再试"
@@ -367,12 +405,18 @@ def fmt_music(user_msg: str = "", openid: str = "") -> str:
     import random as _random
     song = _random.choice(songs)
     name = song.get("name", "未知歌曲")
-    artist = song.get("artist", "未知艺术家")
-    cover = song.get("cover", "")
+    artist = song.get("artist", "")
+    audio_url = song.get("url", "")
 
-    lines = [f"🎵 {name}", f"👤 {artist}"]
-    if cover:
-        lines.append(f"[封面]({cover})")
+    if audio_url and openid:
+        if upload_and_send_voice(openid, audio_url, msg_id):
+            # Voice message sent — also send text with song info
+            send_qq(openid, f"🎵 {name}" + (f" — {artist}" if artist else ""))
+            return None  # Already handled
+
+    # Fallback: text-only
+    lines = [f"🎵 {name}"]
+    if artist: lines.append(f"👤 {artist}")
     return "\n".join(lines)
 
 # ── Command dispatch ────────────────────────────────────────
@@ -452,20 +496,19 @@ class Handler(BaseHTTPRequestHandler):
             matched = False
             for prefix, fn in PREFIX_HANDLERS.items():
                 if msg == prefix:
-                    # Bare "luna" without arguments
-                    reply = fn("", openid)
+                    reply = fn("", openid, msg_id)
                     matched = True
                     break
                 elif msg.startswith(prefix + " "):
-                    # "luna hello world"
                     arg = msg[len(prefix) + 1:].strip()
-                    reply = fn(arg, openid)
+                    reply = fn(arg, openid, msg_id)
                     matched = True
                     break
             if not matched:
                 reply = REJECT_MSG
 
-        send_qq(openid, reply, msg_id)
+        if reply is not None:
+            send_qq(openid, reply, msg_id)
         self._json(200, {})
 
     def _json(self, code, data):
