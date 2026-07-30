@@ -2,10 +2,9 @@
 
 - QQ 官方 Webhook 机器人，运行在 127.0.0.1:3005，接收 QQ 消息并返回回复
 - 确定性强过滤：白名单指令 + 正则匹配，不使用 LLM 做安全约束
-- 内置 MC 服务器监控（状态/性能/TPS/内存/日志/备份）
-- 支持 Luna AI 聊天（通过 DeepSeek API），内联键盘交互
+- 内置 MC 服务器监控（状态/性能/TPS/内存/日志/备份），可以在 QQ 端按钮交互
+- 支持 Luna AI 聊天（通过 DeepSeek API）
 - 支持语音消息上传、音乐搜索播放（通过 Enhanced API）
-- 安全：ed25519 签名验证 + msg_id 去重 + 50K token 日配额 + 频控
 - 开发环境：Python 3.12
 
 ## 项目简介
@@ -25,11 +24,10 @@
 
 ```
 qqbot/
-├── filter-proxy.py      # 主程序（893 行）
+├── filter-proxy.py      # 主程序
 ├── daily_counter.py     # 日配额计数器
-├── bot_config.json      # 配置（本地，不提交）
-├── document/            # QQ API 文档（本地）
-└── .env                 # 环境变量（本地）
+├── bot_config.json      # 配置
+└── .env                 # 环境变量
 ```
 
 ## 配置
