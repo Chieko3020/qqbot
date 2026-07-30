@@ -17,3 +17,4 @@ versions/
 logs/
 .vscode/
 .qqbot/
+.daily_usage

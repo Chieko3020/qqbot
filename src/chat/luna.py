@@ -27,7 +27,7 @@ def fmt_luna(user_msg: str, openid: str = "", msg_id: str = "") -> str:
     if not user_msg.strip():
         return "🌸 有什么事吗？"
 
-    from daily_counter import increment as daily_inc
+    from ..daily_counter import increment as daily_inc
     _, used = daily_inc("luna", 50000, dry_run=True)
     if used >= 50000:
         return f"🌸 今天已经用了 {used} tokens，明天再来找我吧"
