@@ -1,7 +1,7 @@
 # qqbot/luna.py — Luna AI chat via DeepSeek
 import json
 from urllib.request import Request, urlopen
-from ..core.config import DEEPSEEK_KEY, DEEPSEEK_URL, _luna_ratelimit, _check_rate_limit
+from ..core.config import DEEPSEEK_KEY, DEEPSEEK_URL, _luna_ratelimit, _check_rate_limit, _log
 from ..core.security import _strip_urls, _check_luna_input
 
 LUNA_SYSTEM = (
@@ -68,5 +68,6 @@ def fmt_luna(user_msg: str, openid: str = "", msg_id: str = "") -> str:
         tokens = resp.get("usage", {}).get("total_tokens", 50)
         daily_inc("luna", 50000, amount=tokens)
         return reply
-    except Exception:
+    except Exception as e:
+        _log("ERROR", f"luna API error: {e}")
         return "（露娜暂时不在，请稍后再试）"
