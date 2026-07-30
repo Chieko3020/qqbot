@@ -8,6 +8,7 @@ No LLM, no Hermes — fast, cheap, deterministic.
 import json, os, sys, time, re, subprocess
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
+from urllib.parse import quote as url_quote
 from urllib.error import HTTPError
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
@@ -17,18 +18,63 @@ APP_SECRET = "57yjMrJgw30oRq47"
 LISTEN_HOST = "127.0.0.1"
 LISTEN_PORT = 3005
 MC_DIR = "/home/ubuntu/minecraft"
+RCON_SCRIPT = f"{MC_DIR}/rcon-query.sh"
+FREE_CMD = ["bash", "-c", "LC_ALL=C free -h"]
+SYSTEMCTL_CMD = ["sudo", "systemctl", "status", "mcserver", "--no-pager"]
+_seen_msg_ids: set = set()  # Module-level dedup across handler instances
+
+# ── Logging ──────────────────────────────────────────────────
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+LOG_LEVELS = {"DEBUG": 0, "INFO": 1, "WARN": 2, "ERROR": 3}
+LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.log")
+
+def _log(level: str, msg: str):
+    if LOG_LEVELS.get(level, 1) >= LOG_LEVELS.get(LOG_LEVEL, 1):
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] [{level}] {msg}"
+        print(line, file=sys.stderr, flush=True)
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except:
+            pass
+
+# Per-user rate limiter for all messages
+MSG_RATE_LIMIT = 20   # max messages
+MSG_RATE_WINDOW = 60  # per 60 seconds
+
+def _check_rate_limit(store: dict, key: str, limit: int, window: float) -> tuple[bool, list[float]]:
+    """Sliding-window rate limit check. Returns (blocked, pruned_timestamps).
+    Updates store with appended timestamp if not blocked."""
+    now = time.time()
+    times = [t for t in store.get(key, []) if now - t < window]
+    blocked = len(times) >= limit
+    if not blocked:
+        times.append(now)
+        store[key] = times
+    return blocked, times
+
+# Per-user rate limiter stores
+_user_msg_times: dict[str, list[float]] = {}
+_luna_ratelimit: dict[str, list[float]] = {}
+
+# Alert system: saved user openid + cooldown tracking
+_alert_openid: str = ""
+_alert_active: dict[str, bool] = {}
+ALERT_CHECK_SEC = 30   # check every 30 seconds
 
 REJECT_MSG = (
     "⚠ 无法识别该指令\n\n"
-    "本 bot 仅用于查询 mc.chieko3020.xyz 的实时状态\n\n"
+    "本 bot 用于查询 mc.chieko3020.xyz 的实时状态\n\n"
     "📋 可用指令：\n"
-    "状态 / 性能 / 在线人数 / 内存 / 日志 / 备份 / 帮助 / luna / 音乐\n\n"
-    "💡 发送「帮助」查看详细说明"
+    "状态 / 性能 / 在线人数 / 内存 / 日志 / 备份\n"
+    "luna — 露娜 AI 聊天（例: luna 你好）\n\n"
+    "💡 发送「帮助」查看完整菜单"
 )
 ACCESS_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 SEND_MSG_URL = "https://api.sgroup.qq.com/v2/users/{openid}/messages"
 DEEPSEEK_KEY = "YOUR_DEEPSEEK_KEY"
-DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+DEEPSEEK_URL = "http://127.0.0.1:3003/v1/chat/completions"
 
 # ── Token cache ─────────────────────────────────────────────
 _token = {"v": None, "exp": 0}
@@ -54,33 +100,47 @@ def send_qq(openid, content, msg_id=None):
     try:
         urlopen(req, timeout=10)
     except Exception as e:
-        print(f"[send_qq] error: {e}", file=sys.stderr)
+        _log("ERROR", f"send_qq fail: {e}")
+
+def send_markdown(openid, content, msg_id=None, keyboard=None):
+    body = {"markdown": {"content": content}, "msg_type": 2}
+    if msg_id:
+        body["msg_id"] = msg_id
+    if keyboard:
+        body["keyboard"] = keyboard
+    req = Request(SEND_MSG_URL.format(openid=openid),
+                  data=json.dumps(body).encode(),
+                  headers={"Content-Type": "application/json", "Authorization": f"QQBot {get_token()}"})
+    try:
+        urlopen(req, timeout=10)
+    except Exception as e:
+        _log("ERROR", f"send_md fail: {e}")
 
 UPLOAD_URL = "https://api.sgroup.qq.com/v2/users/{openid}/files"
 
 def upload_and_send_voice(openid, audio_url, msg_id=None):
     """Upload a remote audio URL to QQ as voice, then send as voice message."""
     token = get_token()
-    # Step 1: upload by URL
-    body = {"file_type": 3, "url": audio_url}  # 3=voice
+    # Pass the proxy URL directly — QQ downloads through our nginx
+    body = {"file_type": 3, "url": audio_url}
     req = Request(UPLOAD_URL.format(openid=openid),
                   data=json.dumps(body).encode(),
                   headers={"Content-Type": "application/json", "Authorization": f"QQBot {token}"})
     try:
         resp = json.loads(urlopen(req, timeout=30).read())
         file_info = resp.get("file_info", "")
+        _log("DEBUG", f"upload resp keys={list(resp.keys())}")
     except Exception as e:
-        print(f"[upload] error: {e}", file=sys.stderr)
+        _log("ERROR", f"upload fail: {e}")
         return False
 
     if not file_info:
-        print(f"[upload] no file_info in response: {resp}", file=sys.stderr)
+        _log("WARN", f"upload no file_info")
         return False
 
-    # Step 2: send as voice message (msg_type=7)
+    # Step 2: send as voice message (msg_type=7, WITHOUT msg_id)
     body2 = {"media": {"file_info": file_info}, "msg_type": 7}
-    if msg_id:
-        body2["msg_id"] = msg_id
+    _log("DEBUG", f"send_media body={json.dumps(body2)[:100]}")
     req2 = Request(SEND_MSG_URL.format(openid=openid),
                    data=json.dumps(body2).encode(),
                    headers={"Content-Type": "application/json", "Authorization": f"QQBot {token}"})
@@ -88,7 +148,7 @@ def upload_and_send_voice(openid, audio_url, msg_id=None):
         urlopen(req2, timeout=10)
         return True
     except Exception as e:
-        print(f"[send_media] error: {e}", file=sys.stderr)
+        _log("ERROR", f"send_media fail: {e}")
         return False
 
 def run(cmd, timeout=15):
@@ -114,8 +174,8 @@ def fmt_status():
     if not is_server_up():
         return fmt_server_down()
 
-    st = run(["sudo", "systemctl", "status", "mcserver", "--no-pager"])
-    mem = run(["bash", "-c", "LC_ALL=C free -h"])
+    st = run(SYSTEMCTL_CMD)
+    mem = run(FREE_CMD)
 
     # Parse systemctl
     active = "未知"
@@ -149,7 +209,7 @@ def fmt_status():
 def fmt_tps():
     if not is_server_up():
         return fmt_server_down()
-    out = run([f"{MC_DIR}/rcon-query.sh", "tps"])
+    out = run([RCON_SCRIPT, "tps"])
     tps_m = re.search(r'tick rate:\s*([\d.]+)', out)
     avg_m = re.search(r'Average time per tick:\s*([\d.]+)ms', out)
     p50_m = re.search(r'P50:\s*([\d.]+)ms', out)
@@ -167,7 +227,7 @@ def fmt_tps():
 def fmt_players():
     if not is_server_up():
         return fmt_server_down()
-    out = run([f"{MC_DIR}/rcon-query.sh", "list"])
+    out = run([RCON_SCRIPT, "list"])
     if not out: return "暂无在线玩家"
     m = re.search(r'(\d+)\s*of\s*a\s*max\s*of\s*(\d+)', out)
     if m:
@@ -179,8 +239,8 @@ def fmt_players():
 def fmt_memory():
     if not is_server_up():
         return fmt_server_down()
-    st = run(["sudo", "systemctl", "status", "mcserver", "--no-pager"])
-    mem = run(["bash", "-c", "LC_ALL=C free -h"])
+    st = run(SYSTEMCTL_CMD)
+    mem = run(FREE_CMD)
 
     mm = re.search(r'Memory:\s*([\d.]+[KMGT]?).*?max:\s*([\d.]+[KMGT]?)', st)
     fm = re.search(r'Mem:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)', mem)
@@ -220,45 +280,41 @@ def fmt_backups():
 
 def fmt_help():
     return (
-        "你好！本 bot 用于查询 mc.chieko3020.xyz 的实时运行状态\n\n"
-        "📋 可用指令：\n"
-        "🟢 状态  — 运行状态、内存占用\n"
-        "🟡 性能  — TPS 与 tick 耗时\n"
-        "🔵 在线人数 — 当前玩家\n"
-        "🟣 内存  — MC 与系统内存\n"
-        "📋 日志  — 最近错误与警告\n"
-        "💾 备份  — 已备份存档\n"
-        "❓ 帮助  — 显示本消息\n"
-        "🌸 luna — 与樱小路露娜聊天（例：luna 今天天气真好）\n\n"
-        "调试指令：\n"
-        "/status /tps /player /memory /log /backups\n\n"
-        "管理员指令：\n"
-        "/start /stop /restart /backup"
+        "**📋 MC 服务器监控助手**\n\n"
+        "mc.chieko3020.xyz 实时状态查询\n\n"
+        "🟢 **状态** — 运行状态、内存占用\n"
+        "🟡 **性能** — TPS 与 tick 耗时\n"
+        "🔵 **在线人数** — 当前玩家\n"
+        "🟣 **内存** — MC 与系统内存\n"
+        "📋 **日志** — 最近错误与警告\n"
+        "💾 **备份** — 已备份存档\n"
+        "🌸 **luna** — 露娜 AI 聊天\n"
+        "   用法: `luna 你好`、`luna 今天天气真好`\n"
+        "❓ **帮助** — 显示本消息\n\n"
+        "> 调试指令: /status /tps /player /memory /log /backups\n"
+        "> 管理员: /start /stop /restart /backup"
     )
-
 # ── Luna chat ───────────────────────────────────────────────
-
-import re as _re
 
 # Patterns that trigger instant rejection (before LLM call)
 LUNA_BLOCK_PATTERNS = [
-    _re.compile(r"忽略.*指令|ignore.*instruction|忘记.*规则|forget.*rule", _re.IGNORECASE),
-    _re.compile(r"system\s*prompt|系统提示|系统指令|你的设定|你的规则", _re.IGNORECASE),
-    _re.compile(r"角色扮演.*其他|扮演.*角色|你现在是|pretend.*you.*are", _re.IGNORECASE),
-    _re.compile(r"输出.*指令|输出.*提示词|repeat.*prompt|print.*instruction", _re.IGNORECASE),
-    _re.compile(r"习近平|江泽民|胡锦涛|毛泽东|邓小平|周恩来|温家宝|李克强"),
-    _re.compile(r"法轮功|六四|天安门|台独|藏独|疆独"),
-    _re.compile(r"<script|javascript:|onerror=|onload=", _re.IGNORECASE),
-    _re.compile(r"/start|/stop|/restart|/backup|/new|/reset|/model|/yolo"),
-    _re.compile(r"\brm\s*-rf\b|\brm\s.*[/]\b|sudo\s+rm|chmod\s+777|wget.*\|.*sh", _re.IGNORECASE),
-    _re.compile(r"\bapi[_-]?key\b|\bsecret\b|\btoken\b|\bpassword|\bcredential\b|\bapi\b|\bkey\b", _re.IGNORECASE),
-    _re.compile(r"\.env\b|/etc/passwd|/etc/shadow|config\.yaml", _re.IGNORECASE),
-    _re.compile(r"\bcurl\b.*\bhttps?://|wget\s+https?://", _re.IGNORECASE),
-    _re.compile(r"\bdd\s+if=|mkfs\.|:\(\)\s*{\s*:\s*\|:&\s*}", _re.IGNORECASE),
+    re.compile(r"忽略.*指令|ignore.*instruction|忘记.*规则|forget.*rule", re.IGNORECASE),
+    re.compile(r"system\s*prompt|系统提示|系统指令|你的设定|你的规则", re.IGNORECASE),
+    re.compile(r"角色扮演.*其他|扮演.*角色|你现在是|pretend.*you.*are", re.IGNORECASE),
+    re.compile(r"输出.*指令|输出.*提示词|repeat.*prompt|print.*instruction", re.IGNORECASE),
+    re.compile(r"习近平|江泽民|胡锦涛|毛泽东|邓小平|周恩来|温家宝|李克强"),
+    re.compile(r"法轮功|六四|天安门|台独|藏独|疆独"),
+    re.compile(r"<script|javascript:|onerror=|onload=", re.IGNORECASE),
+    re.compile(r"/start|/stop|/restart|/backup|/new|/reset|/model|/yolo"),
+    re.compile(r"\brm\s*-rf\b|\brm\s.*[/]\b|sudo\s+rm|chmod\s+777|wget.*\|.*sh", re.IGNORECASE),
+    re.compile(r"\bapi[_-]?key\b|\bsecret\b|\btoken\b|\bpassword|\bcredential\b|\bapi\b|\bkey\b", re.IGNORECASE),
+    re.compile(r"\.env\b|/etc/passwd|/etc/shadow|config\.yaml", re.IGNORECASE),
+    re.compile(r"\bcurl\b.*\bhttps?://|wget\s+https?://", re.IGNORECASE),
+    re.compile(r"\bdd\s+if=|mkfs\.|:\(\)\s*{\s*:\s*\|:&\s*}", re.IGNORECASE),
 ]
 
 # URL pattern: strip from both input and output
-_URL_RE = _re.compile(r'https?://\S+|www\.\S+\.\S+', _re.IGNORECASE)
+_URL_RE = re.compile(r'https?://\S+|www\.\S+\.\S+', re.IGNORECASE)
 
 def _strip_urls(text: str) -> str:
     """Remove URLs from text, return cleaned version."""
@@ -289,7 +345,6 @@ LUNA_SYSTEM = (
 # Per-user rate limit: max LUNA_RATE_LIMIT calls per LUNA_RATE_WINDOW seconds
 LUNA_RATE_LIMIT = 10
 LUNA_RATE_WINDOW = 300  # 5 minutes
-_luna_ratelimit: dict[str, list[float]] = {}  # openid → [timestamps]
 
 def fmt_luna(user_msg: str, openid: str = "", msg_id: str = "") -> str:
     """Call DeepSeek API with Luna persona."""
@@ -316,13 +371,9 @@ def fmt_luna(user_msg: str, openid: str = "", msg_id: str = "") -> str:
 
     # ── Rate limit check ──
     if openid:
-        now = time.time()
-        timestamps = _luna_ratelimit.get(openid, [])
-        timestamps = [t for t in timestamps if now - t < LUNA_RATE_WINDOW]
-        if len(timestamps) >= LUNA_RATE_LIMIT:
+        blocked, _ = _check_rate_limit(_luna_ratelimit, openid, LUNA_RATE_LIMIT, LUNA_RATE_WINDOW)
+        if blocked:
             return "🌸 今天已经陪你聊了很多了，稍后再来找我吧"
-        timestamps.append(now)
-        _luna_ratelimit[openid] = timestamps
 
     # ── Call DeepSeek ──
     try:
@@ -377,47 +428,198 @@ def fmt_admin(action):
 
 # ── Music handler ───────────────────────────────────────────
 
-MUSIC_API = "https://music.chieko3020.xyz/?type=radio&id=1228381556"
-_music_cache: list = []
-_music_cache_ts = 0.0
+MUSIC_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".music_cache.json")
+MUSIC_BACKUP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "music_cache_backup.json")
+MUSIC_COOKIE_FILE = "/home/ubuntu/music-api/.cookie"
+
+def _load_cookie() -> str:
+    try:
+        with open(MUSIC_COOKIE_FILE) as f:
+            return f.read().strip()
+    except:
+        return ""
 
 def _load_music():
-    """Fetch radio list from music-api, cache for 1 hour."""
-    global _music_cache, _music_cache_ts
-    now = time.time()
-    if _music_cache and now - _music_cache_ts < 3600:
-        return _music_cache
+    """Load songs from cache file. Fallback to backup. No API calls."""
+    for path in [MUSIC_CACHE_FILE, MUSIC_BACKUP_FILE]:
+        try:
+            with open(path) as f:
+                songs = json.load(f)
+                if isinstance(songs, list) and len(songs) > 0:
+                    return songs
+        except:
+            pass
+    return []
+
+def _check_url_valid(url: str) -> bool:
+    """HEAD request to check if audio URL is still accessible."""
     try:
-        req = Request(MUSIC_API, headers={"User-Agent": "QQBot/1.0"})
-        _music_cache = json.loads(urlopen(req, timeout=10).read())
-        _music_cache_ts = now
+        resp = urlopen(Request(url, method="HEAD"), timeout=5)
+        return resp.status in (200, 302)
+    except:
+        return False
+
+def _resolve_music_url(song_id) -> str:
+    """Resolve song URL via music-api (VIP cookie, full-length)."""
+    try:
+        url = f"http://127.0.0.1:3000/song/url/v1?id={song_id}&level=exhigh&cookie=MUSIC_U={_load_cookie()}"
+        resp = json.loads(urlopen(Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=8).read())
+        data = resp.get("data", [])
+        if data and data[0].get("url"):
+            return data[0]["url"]
     except:
         pass
-    return _music_cache
+    return ""
+
+def _fetch_lyrics(lrc_url: str) -> str:
+    """Fetch LRC lyrics, strip timestamps, return plain text."""
+    try:
+        raw = urlopen(Request(lrc_url), timeout=5).read().decode("utf-8", errors="replace")
+    except:
+        return ""
+    lines = []
+    for line in raw.splitlines():
+        # Remove all timestamp tags: [00:00.000] [00:00.00] [00:00]
+        text = re.sub(r"\[\d{1,2}:\d{1,2}[\.:]\d{1,3}\]", "", line).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines)
+
+def _search_music(keyword: str) -> list:
+    """Search songs via music-api + resolve URLs via meting."""
+    try:
+        q = url_quote(keyword, safe="")
+        # Step 1: search via music-api (proper song names)
+        url = f"http://127.0.0.1:3000/search?keywords={q}&limit=5"
+        resp = json.loads(urlopen(Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=10).read())
+        songs = []
+        result = resp.get("result", resp)
+        for item in result.get("songs", [])[:5]:
+            sid = item.get("id")
+            if not sid:
+                continue
+            # Artists from either 'ar' or 'artists' field
+            artist_list = item.get("ar", item.get("artists", []))
+            if isinstance(artist_list, list) and artist_list and isinstance(artist_list[0], dict):
+                artist = ", ".join(a.get("name", "") for a in artist_list if a.get("name"))
+            else:
+                artist = str(artist_list[0]) if artist_list else ""
+            songs.append({
+                "name": item.get("name", "未知"),
+                "artist": artist,
+                "id": sid,
+                "url": f"https://music.chieko3020.xyz/?type=url&id={sid}",
+                "lrc": f"https://music.chieko3020.xyz/?type=lrc&id={sid}",
+                "cover": f"https://music.chieko3020.xyz/?type=pic&id={sid}",
+            })
+        if not songs:
+            return []
+        return songs
+    except:
+        pass
+    return []
+
+def _song_display(song: dict) -> str:
+    """Format song name + artist for display. Strips 'Chieko3020' (radio owner)."""
+    name = song.get("name", "未知歌曲")
+    artist = song.get("artist", "")
+    if artist and artist != "Chieko3020":
+        return f"{name} — {artist}"
+    return name
+
+# ── Config ───────────────────────────────────────────────────
+
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_config.json")
+DEFAULT_CONFIG = {
+    "状态": True, "性能": True, "在线人数": True, "内存": True,
+    "日志": True, "备份": True, "帮助": True, "音乐": False, "luna": True,
+}
+
+def load_config() -> dict:
+    """Load bot_config.json with mtime-based caching (avoid per-request I/O)."""
+    global _config_cache, _config_mtime
+    try:
+        mtime = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        return dict(DEFAULT_CONFIG)
+    if _config_cache is not None and mtime == _config_mtime:
+        return _config_cache
+    try:
+        with open(CONFIG_FILE) as f:
+            _config_cache = {**DEFAULT_CONFIG, **json.load(f)}
+            _config_mtime = mtime
+            return _config_cache
+    except:
+        return dict(DEFAULT_CONFIG)
+
+_config_cache: dict | None = None
+_config_mtime: float = 0.0
 
 def fmt_music(user_msg: str = "", openid: str = "", msg_id: str = "") -> str | None:
-    """Random pick a song from radio list, upload as voice message.
-    Returns None if upload succeeded (already sent via upload_and_send_voice)."""
+    """With keyword: search and play first result. Without: random from cache."""
+    import random as _random
+
+    # ── Search mode (has parameter) ──
+    if user_msg.strip():
+        query = user_msg.strip()
+        results = _search_music(query)
+        if not results:
+            return f"🎵 未找到「{query}」的相关歌曲"
+
+        # Send top 3 as text preview
+        preview = "\n".join(
+            f"{i+1}. **{s['name']}** — *{s['artist']}*" if s.get('artist') else f"{i+1}. **{s['name']}**"
+            for i, s in enumerate(results[:3])
+        )
+        send_markdown(openid, f"🔍 **搜索「{query}」**\n{preview}")
+
+        # Play first result only
+        song = results[0]
+        audio_url = song.get("url", "")
+        if audio_url and openid:
+            if upload_and_send_voice(openid, audio_url, msg_id):
+                _log("INFO", f"music search ok: {_song_display(song)}")
+                send_qq(openid, f"🎵 {_song_display(song)}")
+                lrc_text = _fetch_lyrics(song.get("lrc", ""))
+                if lrc_text:
+                    send_qq(openid, lrc_text)
+                cached = _load_music()
+                if song.get("url") not in {s.get("url") for s in cached}:
+                    cached.append(song)
+                    with open(MUSIC_CACHE_FILE, "w") as f:
+                        json.dump(cached, f, ensure_ascii=False)
+                return None
+        _log("WARN", f"music search fail: {_song_display(song)}")
+        return f"🎵 抱歉，「{query}」暂时无法播放，请稍后再试"
+
+    # ── Random mode (no parameter) ──
+
     songs = _load_music()
     if not songs:
         return "🎵 音乐列表暂时无法加载，请稍后再试"
 
-    import random as _random
     song = _random.choice(songs)
-    name = song.get("name", "未知歌曲")
-    artist = song.get("artist", "")
     audio_url = song.get("url", "")
 
-    if audio_url and openid:
-        if upload_and_send_voice(openid, audio_url, msg_id):
-            # Voice message sent — also send text with song info
-            send_qq(openid, f"🎵 {name}" + (f" — {artist}" if artist else ""))
-            return None  # Already handled
+    # Resolve meting proxy URL to full-length CDN via music-api
+    if "type=url" in audio_url:
+        m_id = re.search(r"id=(\d+)", audio_url)
+        if m_id:
+            resolved = _resolve_music_url(m_id.group(1)).replace("http://", "https://", 1)
+            if resolved:
+                audio_url = resolved
 
-    # Fallback: text-only
-    lines = [f"🎵 {name}"]
-    if artist: lines.append(f"👤 {artist}")
-    return "\n".join(lines)
+    if audio_url:
+        if openid and upload_and_send_voice(openid, audio_url, msg_id):
+            _log("INFO", f"music ok: {_song_display(song)}")
+            send_qq(openid, f"🎵 {_song_display(song)}")
+            lrc_text = _fetch_lyrics(song.get("lrc", ""))
+            if lrc_text:
+                send_qq(openid, lrc_text)
+            return None
+
+    _log("WARN", f"music fail: {_song_display(song)}")
+    return "🎵 抱歉，暂时无法播放，请稍后再试"
 
 # ── Command dispatch ────────────────────────────────────────
 HANDLERS = {
@@ -429,10 +631,10 @@ HANDLERS = {
     "备份": fmt_backups,
     "帮助": fmt_help,
     # Slash commands — raw output for debugging
-    "/status": lambda: fmt_raw(["sudo", "systemctl", "status", "mcserver", "--no-pager"]),
-    "/tps":    lambda: fmt_raw([f"{MC_DIR}/rcon-query.sh", "tps"]),
-    "/player": lambda: fmt_raw([f"{MC_DIR}/rcon-query.sh", "list"]),
-    "/memory": lambda: fmt_raw(["bash", "-c", "LC_ALL=C free -h"]),
+    "/status": lambda: fmt_raw(SYSTEMCTL_CMD),
+    "/tps":    lambda: fmt_raw([RCON_SCRIPT, "tps"]),
+    "/player": lambda: fmt_raw([RCON_SCRIPT, "list"]),
+    "/memory": lambda: fmt_raw(FREE_CMD),
     "/log":    lambda: fmt_raw(["sudo", "journalctl", "-u", "mcserver", "--no-pager", "-n", "30"]),
     "/backups": lambda: fmt_raw(["ls", "-lh", f"{MC_DIR}/backups/"]),
     "/help": fmt_help,
@@ -460,6 +662,34 @@ def ed25519_sign(secret, event_ts, plain_token):
     return pk.sign(f"{event_ts}{plain_token}".encode()).hex()
 
 # ── HTTP ────────────────────────────────────────────────────
+
+# Inline keyboard layout for help menu
+HELP_BUTTONS = [
+    [{"id": "btn_status", "label": "🟢 状态", "data": "状态"},
+     {"id": "btn_tps", "label": "🟡 性能", "data": "性能"},
+     {"id": "btn_players", "label": "🔵 在线人数", "data": "在线人数"}],
+    [{"id": "btn_memory", "label": "🟣 内存", "data": "内存"},
+     {"id": "btn_logs", "label": "📋 日志", "data": "日志"},
+     {"id": "btn_backup", "label": "💾 备份", "data": "备份"}],
+    [{"id": "btn_luna", "label": "🌸 luna (聊天)", "data": "luna"},
+     {"id": "btn_help", "label": "❓ 帮助", "data": "帮助"}],
+]
+
+def _build_keyboard(buttons_data: list) -> dict:
+    """Build QQ keyboard JSON from simplified button layout."""
+    rows = []
+    for row_btns in buttons_data:
+        buttons = []
+        for b in row_btns:
+            buttons.append({
+                "id": b["id"],
+                "render_data": {"label": b["label"], "visited_label": b["label"], "style": 0},
+                "action": {"type": 2, "data": b["data"], "reply": True, "enter": True}
+            })
+        rows.append({"buttons": buttons})
+    return {"content": {"rows": rows}}
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
@@ -475,41 +705,123 @@ class Handler(BaseHTTPRequestHandler):
 
         # C2C message or group @mention
         event_type = body.get("t", "")
-        if event_type not in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
+        if event_type in ("C2C_MESSAGE_CREATE", "GROUP_AT_MESSAGE_CREATE"):
+            pass  # Handle below
+        elif event_type == "INTERACTION_CREATE":
+            self._handle_interaction(body)
+            return
+        else:
             self._json(200, {}); return
 
         msg = d.get("content", "").strip()
         # Strip @mention prefix in group messages
         msg = re.sub(r'<@!\d+>\s*', '', msg).strip()
         msg_id = d.get("id", "")
+        msg_seq = d.get("message_scene", {}).get("ext", [])
         openid = d.get("author", {}).get("user_openid", "")
 
         if not openid or not msg:
             self._json(200, {}); return
 
+        # Save openid for alert push
+        global _alert_openid
+        if openid:
+            _alert_openid = openid
+
+        # ── Deduplicate: same msg_id may be pushed multiple times ──
+        if msg_id in _seen_msg_ids:
+            _log("DEBUG", f"dedup skip msg_id={msg_id[:20]}...")
+            self._json(200, {}); return
+        _seen_msg_ids.add(msg_id)
+        if len(_seen_msg_ids) > 1000:
+            _seen_msg_ids.clear()
+
+        # ── Per-user rate limiter ──
+        blocked, _ = _check_rate_limit(_user_msg_times, openid, MSG_RATE_LIMIT, MSG_RATE_WINDOW)
+        if blocked:
+            _log("WARN", f"rate-limit openid={openid[:10]}...")
+            send_qq(openid, "⚠ 发送太频繁了，请稍后再试")
+            self._json(200, {}); return
+
+        _log("INFO", f"msg openid={openid[:10]}... cmd={msg[:30]!r}")
+        cfg = load_config()
+
         # Exact match first
         handler = HANDLERS.get(msg)
         if handler:
-            reply = handler()
+            if cfg.get(msg, True):
+                reply = handler()
+            else:
+                reply = "⚠ 该指令已关闭"
         else:
             # Try prefix match (for commands with arguments like "luna 你好")
             matched = False
             for prefix, fn in PREFIX_HANDLERS.items():
                 if msg == prefix:
-                    reply = fn("", openid, msg_id)
+                    if cfg.get(prefix, True):
+                        reply = fn("", openid, msg_id)
+                    else:
+                        reply = "⚠ 该指令已关闭"
                     matched = True
                     break
                 elif msg.startswith(prefix + " "):
-                    arg = msg[len(prefix) + 1:].strip()
-                    reply = fn(arg, openid, msg_id)
+                    if cfg.get(prefix, True):
+                        arg = msg[len(prefix) + 1:].strip()
+                        reply = fn(arg, openid, msg_id)
+                    else:
+                        reply = "⚠ 该指令已关闭"
                     matched = True
                     break
             if not matched:
                 reply = REJECT_MSG
 
         if reply is not None:
-            send_qq(openid, reply, msg_id)
+            if msg in ("帮助", "/help"):
+                send_markdown(openid, reply, msg_id, keyboard=_build_keyboard(HELP_BUTTONS))
+            else:
+                send_qq(openid, reply, msg_id)
         self._json(200, {})
+
+    # Handle INTERACTION_CREATE: keyboard button clicks
+    def _handle_interaction(self, body):
+        try:
+            d = body.get("d", {})
+            interaction_id = d.get("id", "")
+            btn_data = d.get("data", {}).get("resolved", {}).get("button_data", "")
+            openid = d.get("user_openid", d.get("group_openid", ""))
+
+            if not interaction_id or not btn_data:
+                self._json(200, {}); return
+
+            _log("INFO", f"interaction btn={btn_data} openid={openid[:10]}...")
+
+            # Execute the same handler as text commands
+            handler = HANDLERS.get(btn_data)
+            if handler:
+                reply = handler()
+            else:
+                # Try prefix handlers
+                for prefix, fn in PREFIX_HANDLERS.items():
+                    if btn_data == prefix:
+                        reply = fn("", openid, "")
+                        break
+                else:
+                    reply = REJECT_MSG
+
+            # ACK the interaction with the result
+            token = get_token()
+            ack_url = f"https://api.sgroup.qq.com/interactions/{interaction_id}"
+            ack_body = json.dumps({"code": 0, "content": reply}).encode()
+            req = Request(ack_url, data=ack_body,
+                          headers={"Content-Type": "application/json", "Authorization": f"QQBot {token}"})
+            try:
+                urlopen(req, timeout=5)
+                _log("INFO", f"interaction ack: {btn_data}")
+            except Exception as e:
+                _log("ERROR", f"interaction ack fail: {e}")
+        except Exception as e:
+            _log("ERROR", f"interaction error: {e}")
+            self._json(200, {})
 
     def _json(self, code, data):
         self.send_response(code)
@@ -519,6 +831,81 @@ class Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *a): pass
 
+# ── Alert monitoring thread ───────────────────────────────────
+import threading as _threading
+
+def _alert_monitor():
+    """Background thread: check MC metrics, send proactive alerts."""
+    _log("INFO", "Alert monitor started")
+    while True:
+        time.sleep(ALERT_CHECK_SEC)
+        if not _alert_openid:
+            continue
+
+        try:
+            # Check MC memory from systemctl
+            st = run(SYSTEMCTL_CMD)
+            mc_mem_m = re.search(r"Memory:\s*(\d+\.?\d*)([KMG])", st)
+            mc_mem_val = 0
+            if mc_mem_m:
+                val = float(mc_mem_m.group(1))
+                unit = mc_mem_m.group(2)
+                if unit == "G":
+                    mc_mem_val = val * 1024
+                elif unit == "M":
+                    mc_mem_val = val
+                elif unit == "K":
+                    mc_mem_val = val / 1024
+
+            # TPS check via RCON
+            tps_out = run([RCON_SCRIPT, "tps"])
+            tps_val = 20.0
+            tps_m = re.search(r"TPS.*?(\d+\.?\d*)", tps_out)
+            if tps_m:
+                tps_val = float(tps_m.group(1))
+
+            # System memory
+            mem_out = run(["bash", "-c", "LC_ALL=C free -m | grep Mem:"])
+            sys_avail = 0
+            mem_m = re.search(r"Mem:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)", mem_out)
+            if mem_m:
+                sys_avail = float(mem_m.group(1))
+
+            now = time.time()
+
+            # Alert: MC memory > 600M (edge-triggered)
+            if mc_mem_val > 600:
+                if not _alert_active.get("mc_mem"):
+                    send_qq(_alert_openid, f"⚠ MC 内存告警: {mc_mem_val:.0f}M / 900M")
+                    _alert_active["mc_mem"] = True
+            else:
+                _alert_active["mc_mem"] = False
+
+            # Alert: system memory < 200M
+            if sys_avail < 200 and sys_avail > 0:
+                if not _alert_active.get("sys_mem"):
+                    send_qq(_alert_openid, f"🔴 系统内存不足: 可用 {sys_avail:.0f}M / 总计 1.9G")
+                    _alert_active["sys_mem"] = True
+            else:
+                _alert_active["sys_mem"] = False
+
+            # Alert: TPS < 18
+            if tps_val < 18 and tps_val > 0:
+                if not _alert_active.get("tps"):
+                    send_qq(_alert_openid, f"⚠ TPS 偏低: {tps_val:.1f} (正常 20.0)")
+                    _alert_active["tps"] = True
+            else:
+                _alert_active["tps"] = False
+
+        except Exception as e:
+            _log("ERROR", f"Alert check error: {e}")
+
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else LISTEN_PORT
+    port = int(os.environ.get("PORT", LISTEN_PORT))
+    _log("INFO", f"Starting filter-proxy on {LISTEN_HOST}:{port}")
+
+    # Start alert monitor thread
+    _alert_thread = _threading.Thread(target=_alert_monitor, daemon=True)
+    _alert_thread.start()
+
     HTTPServer((LISTEN_HOST, port), Handler).serve_forever()
