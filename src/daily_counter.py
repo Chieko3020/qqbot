@@ -2,7 +2,7 @@
 """Daily usage counter — track tokens per service, reset at midnight."""
 import os, time
 
-COUNTER_FILE = os.path.join(os.path.expanduser("~"), ".daily_usage")
+COUNTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".daily_usage")
 
 def _today_key():
     return time.strftime("%Y%m%d")
