@@ -5,3 +5,11 @@ __pycache__/
 .music_cache.json
 .music_radio.json
 .music_playlist.json
+music_cache_backup.json
+bot_config.json
+*.backup-*
+document/
+.env
+*.pid
+.DS_Store
+.specstory/
