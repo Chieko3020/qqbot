@@ -90,11 +90,47 @@ def _backup_world() -> str:
 
 # ── Output formatters ───────────────────────────────────────
 
+def _sys_info() -> dict:
+    """Collect Linux system metrics: swap, disk, CPU, load."""
+    info = {}
+    # Swap
+    try:
+        sw = run(["bash", "-c", "LC_ALL=C free -m | grep Swap:"])
+        if sw:
+            parts = sw.split()
+            info["swap_used"] = parts[1] if len(parts) > 1 else "0"
+            info["swap_total"] = parts[2] if len(parts) > 2 else "0"
+    except: pass
+    # Disk (server dir)
+    try:
+        disk = run(["df", "-h", _mc_cfg()["server_dir"]])
+        if disk:
+            parts = disk.split("\n")[-1].split()
+            info["disk_used"] = parts[2] if len(parts) > 2 else ""
+            info["disk_total"] = parts[1] if len(parts) > 1 else ""
+            info["disk_pct"] = parts[4] if len(parts) > 4 else ""
+    except: pass
+    # Load
+    try:
+        load = run(["cat", "/proc/loadavg"])
+        if load:
+            info["load"] = load.split()[:3]
+    except: pass
+    # CPU count
+    try:
+        info["cpus"] = run(["nproc"])
+    except: pass
+    return info
+
 def fmt_status():
     if not is_server_up():
         return fmt_server_down()
     st = run(["sudo", "systemctl", "status", _mc_cfg()["service_name"], "--no-pager"])
     mem = run(FREE_CMD)
+    si = _sys_info()
+    tps_out = _rcon("/tick query")
+    players_out = _rcon("/list")
+
     active, uptime, mc_mem = "未知", "", ""
     m = re.search(r'Active:\s*(\S+)\s*\((\S+)\)\s*since\s*(.+?);\s*(.+?)\n', st)
     if m:
@@ -102,24 +138,63 @@ def fmt_status():
         uptime = re.sub(r'\s+ago$', '', m.group(4).strip())
     mm = re.search(r'Memory:\s*([\d.]+[KMGT]?)', st)
     if mm: mc_mem = mm.group(1)
+
     fm = re.search(r'Mem:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)', mem)
     ft = re.search(r'Mem:\s+(\S+)', mem)
-    lines = [f"🟢 服务器{active} | 已运行 {uptime}"]
+
+    # TPS
+    tps_val = ""
+    tps_m = re.search(r'tick rate:\s*([\d.]+)', tps_out)
+    if tps_m: tps_val = f"TPS: {tps_m.group(1)}"
+
+    # Players
+    players = ""
+    pm = re.search(r'(\d+)\s*of\s*a\s*max\s*of\s*(\d+)', players_out)
+    if pm: players = f"玩家: {pm.group(1)}/{pm.group(2)}"
+
+    lines = [f"🟢 MC Server | 已运行 {uptime}"]
+    if tps_val or players:
+        line2 = []
+        if tps_val: line2.append(tps_val)
+        if players: line2.append(players)
+        lines.append(" | ".join(line2))
     if mc_mem: lines.append(f"MC 内存: {mc_mem}")
     if fm and ft: lines.append(f"系统: 可用 {fm.group(1)} / 总计 {ft.group(1)}")
+    if si.get("swap_used"): lines.append(f"Swap: {si['swap_used']}M / {si['swap_total']}M")
+    if si.get("load"): lines.append(f"Load: {' / '.join(si['load'][:3])} | CPU: {si.get('cpus','?')}核")
+    if si.get("disk_used"): lines.append(f"磁盘: {si['disk_used']} / {si['disk_total']} ({si.get('disk_pct','')})")
     return "\n".join(lines)
 
 def fmt_tps():
     if not is_server_up():
         return fmt_server_down()
     out = _rcon("/tick query")
+    si = _sys_info()
+    lines = []
+
+    tps_m = re.search(r'tick rate:\s*([\d.]+)', out)
+    tps_val = float(tps_m.group(1)) if tps_m else 0
+    # Status indicator
+    if tps_val >= 19.5: status = "✅ 性能正常"
+    elif tps_val >= 15: status = "🟡 性能一般"
+    else: status = "🔴 性能较差"
+
     parts = []
-    for pat, label in [(r'tick rate:\s*([\d.]+)', 'TPS'), (r'Average time per tick:\s*([\d.]+)ms', 'MSPT'),
-                       (r'P50:\s*([\d.]+)ms', 'P50'), (r'P95:\s*([\d.]+)ms', 'P95'),
+    for pat, label in [(r'tick rate:\s*([\d.]+)', 'TPS'),
+                       (r'Average time per tick:\s*([\d.]+)ms', 'MSPT'),
+                       (r'P50:\s*([\d.]+)ms', 'P50'),
+                       (r'P95:\s*([\d.]+)ms', 'P95'),
                        (r'P99:\s*([\d.]+)ms', 'P99')]:
         m = re.search(pat, out)
         if m: parts.append(f"{label}: {m.group(1)}{'ms' if label!='TPS' else ''}")
-    return " | ".join(parts) if parts else "(无数据)"
+    if parts:
+        lines.append(" | ".join(parts))
+        lines.append(status)
+
+    # System info merged
+    if si.get("load"): lines.append(f"Load: {' / '.join(si['load'][:3])} | CPU: {si.get('cpus','?')}核")
+    if si.get("swap_used"): lines.append(f"Swap: {si['swap_used']}M / {si['swap_total']}M")
+    return "\n".join(lines) if lines else "(无数据)"
 
 def fmt_players():
     if not is_server_up():
@@ -137,12 +212,18 @@ def fmt_memory():
         return fmt_server_down()
     st = run(["sudo", "systemctl", "status", _mc_cfg()["service_name"], "--no-pager"])
     mem = run(FREE_CMD)
+    si = _sys_info()
+
     mm = re.search(r'Memory:\s*([\d.]+[KMGT]?).*?max:\s*([\d.]+[KMGT]?)', st)
     fm = re.search(r'Mem:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)', mem)
     ft = re.search(r'Mem:\s+(\S+)', mem)
+
     lines = []
-    if mm: lines.append(f"MC 内存: {mm.group(1)}/{mm.group(2)}")
-    if fm and ft: lines.append(f"系统内存: 可用 {fm.group(1)} / 总计 {ft.group(1)}")
+    if mm: lines.append(f"MC 内存: {mm.group(1)} / {mm.group(2)}")
+    if fm and ft: lines.append(f"系统: 可用 {fm.group(1)} / 总计 {ft.group(1)}")
+    if si.get("swap_used"): lines.append(f"Swap: {si['swap_used']}M / {si['swap_total']}M")
+    if si.get("disk_used"): lines.append(f"磁盘: {si['disk_used']} / {si['disk_total']} ({si.get('disk_pct','')})")
+    if si.get("load"): lines.append(f"Load(1/5/15min): {' / '.join(si['load'][:3])}")
     return "\n".join(lines) if lines else "(无数据)"
 
 def fmt_logs():
@@ -174,10 +255,10 @@ def fmt_help():
     return (
         "**📋 MC 服务器监控助手**\n\n"
         "mc.chieko3020.xyz 实时状态查询\n\n"
-        "🟢 **状态** — 运行状态、内存占用\n"
-        "🟡 **性能** — TPS 与 tick 耗时\n"
+        "🟢 **状态** — 仪表盘（运行+TPS+玩家+内存+磁盘）\n"
+        "🟡 **性能** — TPS 指标 + 系统负载\n"
         "🔵 **在线人数** — 当前玩家\n"
-        "🟣 **内存** — MC 与系统内存\n"
+        "🟣 **内存** — MC/系统/Swap/磁盘详情\n"
         "📋 **日志** — 最近错误与警告\n"
         "💾 **备份** — 已备份存档\n"
         "🌸 **luna** — 露娜 AI 聊天\n"
