@@ -11,7 +11,7 @@ ACCESS_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 SEND_MSG_URL = "https://api.sgroup.qq.com/v2/users/{openid}/messages"
 UPLOAD_URL = "https://api.sgroup.qq.com/v2/users/{openid}/files"
 
-DEEPSEEK_KEY = "YOUR_DEEPSEEK_KEY"
+DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY", "")
 DEEPSEEK_URL = "http://127.0.0.1:3003/v1/chat/completions"
 
 FREE_CMD = ["bash", "-c", "LC_ALL=C free -h"]
