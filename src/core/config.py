@@ -1,18 +1,18 @@
 # qqbot/config.py — shared configuration, logging, rate limiting
 import json, os, sys, time
 
-# ── QQ Bot credentials ──────────────────────────────────────
-APP_ID = "1905273698"
-APP_SECRET = "57yjMrJgw30oRq47"
-LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 3005
+# ── QQ Bot credentials (环境变量注入，禁止硬编码) ─────────────
+APP_ID = os.environ.get("QQ_APP_ID", "")
+APP_SECRET = os.environ.get("QQ_APP_SECRET", "")
+LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "4001"))
 
 ACCESS_TOKEN_URL = "https://bots.qq.com/app/getAppAccessToken"
 SEND_MSG_URL = "https://api.sgroup.qq.com/v2/users/{openid}/messages"
 UPLOAD_URL = "https://api.sgroup.qq.com/v2/users/{openid}/files"
 
 DEEPSEEK_KEY = os.environ.get("DEEPSEEK_KEY", "")
-DEEPSEEK_URL = "http://127.0.0.1:3003/v1/chat/completions"
+DEEPSEEK_URL = os.environ.get("DEEPSEEK_URL", "http://127.0.0.1:4000/v1/chat/completions")
 
 FREE_CMD = ["bash", "-c", "LC_ALL=C free -h"]
 

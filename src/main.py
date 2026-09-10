@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 # qqbot/main.py — entry point: HTTP handler + alert monitor
-import json, os, re, time, threading
+import json, os, re, sys, time, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.request import Request, urlopen
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from .core.config import (
-    APP_SECRET, LISTEN_HOST, LISTEN_PORT, _log, _check_rate_limit,
+    APP_ID, APP_SECRET, LISTEN_HOST, LISTEN_PORT, _log, _check_rate_limit,
     _seen_msg_ids, _user_msg_times, _alert_openid, _alert_active,
     ALERT_CHECK_SEC, MSG_RATE_LIMIT, MSG_RATE_WINDOW, REJECT_MSG, load_config,
 )
@@ -169,14 +169,17 @@ def _alert_monitor():
             continue
         try:
             st = run(["sudo", "systemctl", "status", "mcserver", "--no-pager"])
-            mc_mem_m = re.search(r"Memory:\s*(\d+\.?\d*)([KMG])", st)
+            # 仅当服务 active 时才检查内存（避免 cgroup 残留导致幽灵告警）
+            is_active = "Active: active" in st
             mc_mem_val = 0
-            if mc_mem_m:
-                val = float(mc_mem_m.group(1))
-                unit = mc_mem_m.group(2)
-                if unit == "G": mc_mem_val = val * 1024
-                elif unit == "M": mc_mem_val = val
-                elif unit == "K": mc_mem_val = val / 1024
+            if is_active:
+                mc_mem_m = re.search(r"Memory:\s*(\d+\.?\d*)([KMG])", st)
+                if mc_mem_m:
+                    val = float(mc_mem_m.group(1))
+                    unit = mc_mem_m.group(2)
+                    if unit == "G": mc_mem_val = val * 1024
+                    elif unit == "M": mc_mem_val = val
+                    elif unit == "K": mc_mem_val = val / 1024
             mem_out = run(["bash", "-c", "LC_ALL=C free -m | grep Mem:"])
             sys_avail = 0
             mem_m = re.search(r"Mem:\s+\S+\s+\S+\s+\S+\s+\S+\s+\S+\s+(\S+)", mem_out)
@@ -197,6 +200,9 @@ def _alert_monitor():
 
 # ── Entry point ──────────────────────────────────────────────
 def main():
+    if not APP_ID or not APP_SECRET:
+        _log("ERROR", "缺少环境变量 QQ_APP_ID / QQ_APP_SECRET，拒绝启动（凭据只通过环境变量注入，禁止硬编码）")
+        sys.exit(1)
     port = int(os.environ.get("PORT", LISTEN_PORT))
     _log("INFO", f"Starting filter-proxy on {LISTEN_HOST}:{port}")
     threading.Thread(target=_alert_monitor, daemon=True).start()
